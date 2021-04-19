@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Mahmoud Ahmedy / Udacity
+  This template deploys the server infrastructure of a high availability app.
+  Deployments:
+  - Security Groups:
+    - Load Balancer
+    - Web Server
+    - Jumpbox Server
+  - Application Load Balancer
+  - Auto Scaling Group
+  - Jumpbox Instance for each Availability Zone
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+
+  WebServerImageAMI:
+    Description: Web Server Machine Linux distro AMI
+    Type: String
+    Default: ami-02701bcdc5509e57b
+  
+  JumpboxImageAMI:
+    Description: Jumpbox Machine Linux distro AMI
+    Type: String
+    Default: ami-0518bb0e75d3619ca
+
+  WebServerGroupMinSize:
+    Description: Minimum number of web application servers
+    Type: String
+    Default: '2'
+
+  WebServerGroupMaxSize:
+    Description: Maximum number of web application servers
+    Type: String
+    Default: '4'
+
+  WebServerGroupDesiredCapacity:
+    Description: Desired initial number of web application servers
+    Type: String
+    Default: '4'
+
+  S3CodeRepo:
+    Description: Full S3 path and file name of zipped file
+    Type: String
+    Default: 's3://udacity-s3/devops/udacity.zip'
+
+  KeyPairName:
+    Description: Name of key-pair (PEM) file for devops access.
+    Type: String
+    Default: 'ha-app-devops'
+
+Resources:
+  LoadBalancerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the load balancer
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${EnvironmentName} Load Balancer Security Group
+
+  WebServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for web servers
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - SourceSecurityGroupId:
+          Ref: LoadBalancerSecGroup
+        IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+      - SourceSecurityGroupId:
+          Ref: JumpboxSecGroup
+        IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${EnvironmentName} Web Server Security Group
+
+  JumpboxSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Jumpbox Servers
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - CidrIp: 0.0.0.0/0
+        IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${EnvironmentName} Jumpbox Security Group
+
+  WebServerLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            sudo apt update -y
+            sudo apt install unzip awscli -y
+            mkdir html
+            aws s3 cp ${S3CodeRepo} html
+            unzip -o html/udacity.zip -d html
+            sudo chown -R www-data:www-data html
+            apt-get -y install apt-transport-https ca-certificates curl gnupg-agent software-properties-common lsb-release
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+            echo \
+              "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            apt-get update
+            apt-get -y install docker-ce docker-ce-cli containerd.io
+            usermod -aG docker ubuntu
+            docker run -dit --name ${EnvironmentName} -p 80:80 -v /html:/usr/local/apache2/htdocs httpd:latest
+      ImageId:
+        Ref: WebServerImageAMI
+      IamInstanceProfile:
+        Ref: ListBucketInstanceProfile
+      SecurityGroups:
+      - Ref: WebServerSecGroup
+      InstanceType: t3.small
+      BlockDeviceMappings:
+      - DeviceName: "/dev/sdk"
+        Ebs:
+          VolumeSize: "10"
+  
+  WebAppGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-PRIV-NETS"
+      LaunchConfigurationName:
+        Ref: WebServerLaunchConfig
+      DesiredCapacity:
+        Ref: WebServerGroupDesiredCapacity
+      MinSize:
+        Ref: WebServerGroupMinSize
+      MaxSize:
+        Ref: WebServerGroupMaxSize
+      MetricsCollection:
+        - Granularity: "1Minute"
+          Metrics:
+            - "GroupMinSize"
+            - "GroupMaxSize"
+      TargetGroupARNs:
+      - Ref: "WebAppTargetGroup"
+
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID"
+  
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: LoadBalancerSecGroup
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: "forward"
+        TargetGroupArn:
+          Ref: WebAppTargetGroup
+      LoadBalancerArn:
+        Ref: LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  ApplicationLoadBalancerListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+      - Type: "forward"
+        TargetGroupArn:
+          Ref: WebAppTargetGroup
+      Conditions:
+      - Field: "path-pattern"
+        Values: ["/"]
+      ListenerArn:
+        Ref: Listener
+      Priority: 1
+
+  JumpboxPublicSubnet1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId:
+        Ref: JumpboxImageAMI
+      InstanceType: t2.micro
+      KeyName:
+        Ref: KeyPairName
+      SubnetId:
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-PUB1-SN"
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ''
+      SecurityGroupIds:
+        - Ref: JumpboxSecGroup
+      Tags: 
+        - Key: Name
+          Value:
+            Fn::Sub: ${EnvironmentName} Jumpbox Host 1
+      
+  JumpboxPublicSubnet2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId:
+        Ref: JumpboxImageAMI
+      InstanceType: t2.micro
+      KeyName:
+        Ref: KeyPairName
+      SubnetId:
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-PUB2-SN"
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ''
+      SecurityGroupIds:
+        - Ref: JumpboxSecGroup
+      Tags: 
+        - Key: Name
+          Value:
+            Fn::Sub: ${EnvironmentName} Jumpbox Host 2
+  
+  ListBucketInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: S3BucketRole
+
+  S3BucketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+
+  S3BucketsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: S3BucketsPolicy
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:*
+          Resource: "*"
+      Roles:
+      - Ref: S3BucketRole
+
+Outputs:
+  LoadBalancerDNSName:
+    Description: DNS Name of the web application
+    Value:
+      Fn::Join:
+        - ""
+        - - "http://"
+          - Fn::GetAtt: LoadBalancer.DNSName
+    Export:
+      Name:
+        Fn::Sub: "${EnvironmentName}-DNS-NAME"
+
+  JumpboxHostIPPublicSubnet1:
+    Description: IP address of Jumpbox host in public subnet 1 
+    Value:
+      Fn::GetAtt: JumpboxPublicSubnet1.PublicIp
+    Export:
+      Name:
+        Fn::Sub: "${EnvironmentName}-JUMPBOX-HOST-IP-PUB-SN-1"
+
+  JumpboxHostIPPublicSubnet2:
+    Description: IP address of Jumpbox host in public subnet 2 
+    Value:
+      Fn::GetAtt: JumpboxPublicSubnet2.PublicIp
+    Export:
+      Name:
+        Fn::Sub: "${EnvironmentName}-JUMPBOX-HOST-IP-PUB-SN-2"
+
+  JumpboxHostDNSPublicSubnet1:
+    Description: DNS address of Jumpbox host in public subnet 1
+    Value:
+      Fn::GetAtt: JumpboxPublicSubnet1.PublicDnsName
+    Export:
+      Name:
+        Fn::Sub: "${EnvironmentName}-JUMPBOX-HOST-DNS-PUB-SN-1"
+
+  JumpboxHostDNSPublicSubnet2:
+    Description: DNS address of Jumpbox host in public subnet 2
+    Value:
+      Fn::GetAtt: JumpboxPublicSubnet2.PublicDnsName
+    Export:
+      Name:
+        Fn::Sub: "${EnvironmentName}-JUMPBOX-HOST-DNS-PUB-SN-2"
